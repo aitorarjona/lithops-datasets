@@ -1,10 +1,8 @@
+import asyncio
 import logging
-import os
 import re
 import io
-import subprocess
 import tempfile
-from typing import BinaryIO
 
 import pandas as pd
 
@@ -26,34 +24,53 @@ class GZippedText(CloudObjectBase):
         super().__init__(*args, **kwargs)
         self._index_key = self.cloud_object._key + 'i'
 
-    def preprocess(self, object_stream: BinaryIO):
-        tmp_index_file_name = tempfile.mktemp()
-        try:
-            os.remove(tmp_index_file_name)
-        except FileNotFoundError:
-            pass
+    async def preprocess(self, get_future):
 
-        # Create index
-        index_proc = subprocess.Popen([GZTOOL_PATH, '-i', '-x', '-s', '1', '-I', tmp_index_file_name],
-                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        pipe = await asyncio.subprocess.create_subprocess_shell(f'{GZTOOL_PATH} -i -x -s 1',
+                                                                stdin=asyncio.subprocess.PIPE,
+                                                                stdout=asyncio.subprocess.PIPE,
+                                                                stderr=asyncio.subprocess.PIPE)
 
-        chunk = object_stream.read(CHUNK_SIZE)
-        while chunk != b"":
-            index_proc.stdin.write(chunk)
-            chunk = object_stream.read(CHUNK_SIZE)
-        object_stream.close()
+        await get_future
+        get_response = get_future.result()
+        body_stream = get_response['Body']
+        result_buffer = io.BytesIO()
 
-        stdout, stderr = index_proc.communicate()
-        logger.debug(stdout.decode('utf-8'))
+        async def _async_writer():
+            logger.debug('start writing input')
+            input_chunk = await body_stream.read(CHUNK_SIZE)
+            while input_chunk != b"":
+                pipe.stdin.write(input_chunk)
+                input_chunk = await body_stream.read(CHUNK_SIZE)
+            logger.debug('done writing input')
+
+        async def _async_reader():
+            logger.debug('start reading output')
+            output_chunk = await pipe.stdout.read()
+            while output_chunk != b"":
+                result_buffer.write(output_chunk)
+                output_chunk = await pipe.stdout.read()
+            logger.debug('done reading output')
+
+        async def _async_err():
+            logger.debug('start reading err')
+            output_chunk = await pipe.stderr.read()
+            while output_chunk != b"":
+                print(output_chunk)
+            logger.debug('done reading err')
+
+        await asyncio.gather(_async_writer(), _async_reader(), _async_err())
+        # await asyncio.gather(_async_writer())
+
+        stdout, stderr = await pipe.communicate()
+        # logger.debug(stdout.decode('utf-8'))
         logger.debug(stderr.decode('utf-8'))
-        assert index_proc.returncode == 0
+        assert pipe.returncode == 0
 
-        with open(tmp_index_file_name, 'rb') as index_f:
-            index_bin = index_f.read()
-        output = subprocess.check_output([GZTOOL_PATH, '-ell'], input=index_bin).decode('utf-8')
+        output = subprocess.check_output([GZTOOL_PATH, '-ell'], input=result_buffer.getvalue()).decode('utf-8')
         logger.debug(output)
-        self.cloud_object.s3_client.put_object(Bucket=self.cloud_object._meta_bucket, Key=self._index_key,
-                                               Body=index_bin)
+        await self.cloud_object._s3.put_object(Bucket=self.cloud_object._meta_bucket, Key=self._index_key,
+                                               Body=result_buffer.getvalue())
 
         total_lines = RE_NUMS.findall(RE_NLINES.findall(output).pop()).pop()
 

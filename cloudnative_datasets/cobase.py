@@ -1,9 +1,10 @@
+import asyncio
 import inspect
 import logging
 from typing import Tuple, Dict, BinaryIO
 
-import boto3
 import botocore
+from aiobotocore.session import get_session
 
 from .util import split_s3_path
 
@@ -25,15 +26,8 @@ class CloudObject:
         self._s3_path = s3_path
         self._cls = cloud_object_class
         self._obj_attrs = {}
-
-        if s3_config is None:
-            s3_config = {}
-
-        self.s3_client = boto3.client('s3', aws_access_key_id=s3_config.get('aws_access_key_id'),
-                                      aws_secret_access_key=s3_config.get('aws_secret_access_key'),
-                                      region_name=s3_config.get('region_name'),
-                                      endpoint_url=s3_config.get('endpoint_url'),
-                                      config=botocore.client.Config(**s3_config.get('s3_config_kwargs', {})))
+        self._s3_config = s3_config or {}
+        self._s3 = None
 
         self._obj_bucket, self._key = split_s3_path(s3_path)
         self._meta_bucket = self._obj_bucket + '.meta'
@@ -62,6 +56,17 @@ class CloudObject:
 
         co_instance.s3_client.upload_file(Filename=file_path, Bucket=bucket, Key=key)
 
+    async def _setup(self):
+        self._s3_context = get_session().create_client(
+            's3',
+            aws_access_key_id=self._s3_config.get('aws_access_key_id'),
+            aws_secret_access_key=self._s3_config.get('aws_secret_access_key'),
+            region_name=self._s3_config.get('region_name'),
+            endpoint_url=self._s3_config.get('endpoint_url'),
+            config=botocore.client.Config(**self._s3_config.get('s3_config_kwargs', {}))
+        )
+        self._s3 = await self._s3_context.__aenter__()
+
     def _update_attrs(self):
         print(self._meta_meta)
         self._attributes = {key: value for key, value in self._meta_meta['Metadata'].items()}
@@ -71,9 +76,9 @@ class CloudObject:
             self.fetch()
         return bool(self._obj_meta)
 
-    def is_staged(self):
+    async def is_staged(self):
         try:
-            self.s3_client.head_object(Bucket=self._meta_bucket, Key=self._key)
+            await self._s3.head_object(Bucket=self._meta_bucket, Key=self._key)
             return True
         except botocore.exceptions.ClientError as e:
             logger.debug(e.response)
@@ -85,11 +90,13 @@ class CloudObject:
     def get_attribute(self, key):
         return self._obj_attrs[key]
 
-    def fetch(self):
+    async def fetch(self):
+        if self._s3 is None:
+            await self._setup()
         if not self._obj_meta:
             logger.debug('fetching object head')
             try:
-                head_res = self.s3_client.head_object(Bucket=self._obj_bucket, Key=self._key)
+                head_res = await self._s3.head_object(Bucket=self._obj_bucket, Key=self._key)
                 del head_res['ResponseMetadata']
                 self._obj_meta = head_res
             except botocore.exceptions.ClientError as e:
@@ -100,7 +107,7 @@ class CloudObject:
         if not self._meta_meta:
             logger.debug('fetching meta head')
             try:
-                head_res = self.s3_client.head_object(Bucket=self._meta_bucket, Key=self._key)
+                head_res = await self._s3.head_object(Bucket=self._meta_bucket, Key=self._key)
                 del head_res['ResponseMetadata']
                 self._meta_meta = head_res
                 if 'Metadata' in head_res:
@@ -112,11 +119,11 @@ class CloudObject:
                     raise e
         return self._obj_meta, self._meta_meta
 
-    def preprocess(self):
-        get_res = self.s3_client.get_object(Bucket=self._obj_bucket, Key=self._key)
-        logger.debug(get_res)
-        body, meta = self._child.preprocess(object_stream=get_res['Body'])
-        put_res = self.s3_client.put_object(
+    async def preprocess(self):
+        get_fut = asyncio.ensure_future(self._s3.get_object(Bucket=self._obj_bucket, Key=self._key))
+        logger.debug(get_fut)
+        body, meta = await self._child.preprocess(get_future=get_fut)
+        put_res = self._s3.put_object(
             Body=body,
             Bucket=self._meta_bucket,
             Key=self._key,
